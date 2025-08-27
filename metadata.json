@@ -1,0 +1,7 @@
+{
+  "name": "AI Mentor (Elon Mode)",
+  "description": "A personal AI mentor and coach, inspired by the mindset and style of Elon Musk. It provides concise, direct, no-nonsense answers to help you think bigger, maintain discipline, and achieve high productivity.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
