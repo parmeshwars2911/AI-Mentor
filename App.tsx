@@ -1,216 +1,251 @@
+
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import type { Chat } from '@google/genai';
-import { Message } from './types';
-import { createChatSession } from './services/geminiService';
+import { Session } from '@supabase/supabase-js';
+import { Message, ApiContent } from './types';
+import { getSystemInstruction, generateChatResponse, checkGeminiServiceStatus } from './services/geminiService';
+import { addLog, getLogs } from './services/supabaseService';
+import { signOut, onAuthStateChange } from './services/userService';
 import { ChatMessage } from './components/ChatMessage';
 import { ChatInput } from './components/ChatInput';
 import { Header } from './components/Header';
 import { WelcomeScreen } from './components/WelcomeScreen';
+import { Auth } from './components/Auth';
+import { logSafe } from './services/safeLogger';
 
-// Fix: Add types for the Web Speech API to resolve "Cannot find name 'SpeechRecognition'".
-interface SpeechRecognitionEvent extends Event {
-  readonly resultIndex: number;
-  readonly results: SpeechRecognitionResultList;
-}
-
-interface SpeechRecognitionResultList {
-  readonly length: number;
-  item(index: number): SpeechRecognitionResult;
-  [index: number]: SpeechRecognitionResult;
-}
-
-interface SpeechRecognitionResult {
-  readonly isFinal: boolean;
-  readonly length: number;
-  item(index: number): SpeechRecognitionAlternative;
-  [index: number]: SpeechRecognitionAlternative;
-}
-
-interface SpeechRecognitionAlternative {
-  readonly transcript: string;
-  readonly confidence: number;
-}
-
-interface SpeechRecognitionErrorEvent extends Event {
-  readonly error: string;
-}
-
-interface SpeechRecognition extends EventTarget {
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  start(): void;
-  stop(): void;
-  onstart: (() => void) | null;
-  onend: (() => void) | null;
-  onerror: ((event: SpeechRecognitionErrorEvent) => void) | null;
-  onresult: ((event: SpeechRecognitionEvent) => void) | null;
-}
-
-type SpeechRecognitionConstructor = new () => SpeechRecognition;
-
-// Polyfill for SpeechRecognition
-declare global {
-  interface Window {
-    SpeechRecognition: SpeechRecognitionConstructor;
-    webkitSpeechRecognition: SpeechRecognitionConstructor;
-  }
-}
+type AppState = 'initializing' | 'ready' | 'error';
 
 const App: React.FC = () => {
+  const [session, setSession] = useState<Session | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
-  const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [chat, setChat] = useState<Chat | null>(null);
+  const [isAiReplying, setIsAiReplying] = useState<boolean>(false);
+  const [initializationError, setInitializationError] = useState<string | null>(null);
+  const [appStatus, setAppStatus] = useState('Waiting for user...');
+  const [appState, setAppState] = useState<AppState>('initializing');
   const [inputText, setInputText] = useState('');
   const [isListening, setIsListening] = useState(false);
+
   const [isTtsEnabled, setIsTtsEnabled] = useState(() => {
     if (typeof window !== 'undefined' && window.localStorage) {
       const saved = localStorage.getItem('tts-enabled');
-      return saved ? JSON.parse(saved) : false;
+      return saved ? JSON.parse(saved) : true;
     }
-    return false;
+    return true;
   });
 
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const speechRecognition = useRef<SpeechRecognition | null>(null);
-
-  useEffect(() => {
-    setChat(createChatSession());
-    
-    const SpeechRecognitionAPI = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (SpeechRecognitionAPI) {
-      const recognition: SpeechRecognition = new SpeechRecognitionAPI();
-      recognition.continuous = false;
-      recognition.interimResults = false;
-      recognition.lang = 'en-US';
-
-      recognition.onstart = () => setIsListening(true);
-      recognition.onend = () => setIsListening(false);
-      // Fix: Use strongly-typed event for better type safety.
-      recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
-        console.error('Speech recognition error:', event.error);
-        setIsListening(false);
-      };
-
-      // Fix: Use strongly-typed event for better type safety.
-      recognition.onresult = (event: SpeechRecognitionEvent) => {
-        const transcript = event.results[event.results.length - 1][0].transcript.trim();
-        setInputText(transcript);
-      };
-      speechRecognition.current = recognition;
-    } else {
-      console.warn('Speech Recognition API not supported in this browser.');
-    }
-  }, []);
-
-  useEffect(() => {
-    if (chatContainerRef.current) {
-      chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
-    }
-  }, [messages]);
   
-  useEffect(() => {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      localStorage.setItem('tts-enabled', JSON.stringify(isTtsEnabled));
-    }
-  }, [isTtsEnabled]);
-
-  const handleToggleListening = () => {
-    if (!speechRecognition.current) {
-      alert("Voice recognition is not supported in your browser.");
-      return;
-    }
-    if (isListening) {
-      speechRecognition.current.stop();
-    } else {
-      setInputText('');
-      speechRecognition.current.start();
-    }
-  };
-  
-  const toggleTts = () => {
-    if (isTtsEnabled && window.speechSynthesis.speaking) {
-      window.speechSynthesis.cancel();
-    }
-    setIsTtsEnabled(prev => !prev);
+  const handleSignOut = async () => {
+    await signOut();
+    // The onAuthStateChange listener will handle setting the session to null.
   };
 
   const handleSendMessage = useCallback(async (text: string) => {
-    if (!chat || isLoading || !text.trim()) return;
+    if (!text.trim() || isAiReplying) return;
 
-    setIsLoading(true);
-    setInputText('');
     const userMessage: Message = { id: Date.now().toString(), text, sender: 'user' };
-    setMessages(prev => [...prev, userMessage]);
+    const aiPlaceholder: Message = { id: (Date.now() + 1).toString(), text: '', sender: 'ai' };
 
-    const aiMessageId = (Date.now() + 1).toString();
-    setMessages(prev => [...prev, { id: aiMessageId, text: '', sender: 'ai' }]);
+    const historyForApi = [...messages, userMessage];
+
+    setMessages([...historyForApi, aiPlaceholder]);
+    setInputText('');
+    setIsAiReplying(true);
+    await addLog(userMessage);
 
     try {
-      const stream = await chat.sendMessageStream({ message: text });
+      const systemInstruction = getSystemInstruction();
+      const apiHistory: ApiContent[] = historyForApi
+        .map(msg => ({
+          role: msg.sender === 'user' ? 'user' : 'model',
+          parts: [{ text: msg.text }],
+        }));
       
-      let fullResponse = '';
-      for await (const chunk of stream) {
-        const chunkText = chunk.text;
-        if(chunkText) {
-          fullResponse += chunkText;
-          setMessages(prev =>
-            prev.map(msg =>
-              msg.id === aiMessageId ? { ...msg, text: fullResponse } : msg
-            )
-          );
-        }
-      }
+      const fullResponse = await generateChatResponse(apiHistory, systemInstruction);
+      const finalAiMessage: Message = { id: aiPlaceholder.id, text: fullResponse, sender: 'ai' };
+
+      setMessages(prev => prev.map(msg => msg.id === aiPlaceholder.id ? finalAiMessage : msg));
+      await addLog(finalAiMessage);
 
       if (isTtsEnabled && fullResponse) {
           if(window.speechSynthesis.speaking) window.speechSynthesis.cancel();
           const utterance = new SpeechSynthesisUtterance(fullResponse);
           window.speechSynthesis.speak(utterance);
       }
-
     } catch (error) {
-      console.error("Error sending message:", error);
-      const errorMessage = "Error: Could not get a response. Check your API key and network.";
-      setMessages(prev =>
-        prev.map(msg =>
-          msg.id === aiMessageId ? { ...msg, text: errorMessage } : msg
-        )
-      );
+      logSafe("--- [CHAT ERROR] Gemini API/Supabase Error Caught in handleSendMessage ---", error);
+
+      const rawErrorMessage = (error instanceof Error ? error.message : String(error)).toLowerCase();
+      let userFacingErrorText: string;
+
+      if (rawErrorMessage.includes('api key not valid') || rawErrorMessage.includes('invalid api key')) {
+        userFacingErrorText = `**[API Key Invalid]**\n\nThe provided API key is not valid. Please verify that the \`API_KEY\` environment variable is set correctly.`;
+      } else if (rawErrorMessage.includes('quota')) {
+        userFacingErrorText = `**[API Quota Exceeded]**\n\nThe API key has reached its free daily usage limit. Please wait 24 hours for the quota to reset.`;
+      } else if (rawErrorMessage.includes('safety') || rawErrorMessage.includes('blocked')) {
+         userFacingErrorText = `**[Content Moderation]**\n\nThe AI's response was blocked due to safety settings. Please try rephrasing your message.`;
+      } else if (rawErrorMessage.includes('fetch') || rawErrorMessage.includes('network') || rawErrorMessage.includes('supabase')) {
+         userFacingErrorText = `**[Network Error]**\n\nCould not connect to the backend service. Please check your network and try again.`;
+      } else {
+        userFacingErrorText = `**[CRITICAL: AI Service Failure]**\n\nThe request to the AI service failed for an unknown reason. Please check the console for details.`;
+      }
+      
+      const errorMessage: Message = { 
+        id: aiPlaceholder.id, 
+        text: `${userFacingErrorText}\n\n**Error Details:** \`${rawErrorMessage}\``,
+        sender: 'ai' 
+      };
+      setMessages(prev => prev.map(msg => msg.id === aiPlaceholder.id ? errorMessage : msg));
+      
+      const errorLogObject: Message = {
+        id: aiPlaceholder.id,
+        sender: 'ai',
+        text: `[HANDLER_ERROR] ${userFacingErrorText}`,
+      };
+      await addLog(errorLogObject);
+
     } finally {
-      setIsLoading(false);
+      setIsAiReplying(false);
     }
-  }, [chat, isLoading, isTtsEnabled]);
+  }, [messages, isAiReplying, isTtsEnabled]);
+
+  useEffect(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      const recognition = new SpeechRecognition();
+      recognition.continuous = false;
+      recognition.interimResults = false;
+      recognition.lang = 'en-US';
+
+      recognition.onstart = () => setIsListening(true);
+      recognition.onend = () => setIsListening(false);
+      recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+        logSafe('Speech recognition error:', event.error);
+        setIsListening(false);
+      };
+      recognition.onresult = (event: SpeechRecognitionEvent) => {
+        const transcript = event.results[0][0].transcript;
+        setInputText(transcript);
+        handleSendMessage(transcript);
+      };
+      
+      speechRecognition.current = recognition;
+    }
+  }, [handleSendMessage]);
+
+  useEffect(() => {
+    chatContainerRef.current?.scrollTo({
+      top: chatContainerRef.current.scrollHeight,
+      behavior: 'smooth',
+    });
+  }, [messages]);
+  
+  useEffect(() => {
+    localStorage.setItem('tts-enabled', JSON.stringify(isTtsEnabled));
+  }, [isTtsEnabled]);
+
+  // Main effect to handle authentication state and app initialization
+  useEffect(() => {
+    const { data: authListener } = onAuthStateChange((_event, session) => {
+      setSession(session);
+      
+      const initializeApp = async () => {
+        try {
+          if (session) {
+            setAppState('initializing');
+            setAppStatus('Loading History...');
+            const history = await getLogs();
+            setMessages(history);
+            
+            setAppStatus('Checking AI Service...');
+            const geminiStatus = await checkGeminiServiceStatus();
+            if (!geminiStatus.isReady) {
+              throw new Error(`AI Service Error: ${geminiStatus.error}`);
+            }
+            setAppState('ready');
+          }
+        } catch (error) {
+          logSafe("Initialization failed", error);
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          setInitializationError(`Initialization Failed: ${errorMessage}`);
+          setAppState('error');
+        }
+      };
+
+      initializeApp();
+    });
+
+    return () => {
+      authListener.subscription.unsubscribe();
+       if (window.speechSynthesis && window.speechSynthesis.speaking) {
+        window.speechSynthesis.cancel();
+      }
+    };
+  }, []);
+
+  const toggleListening = () => {
+    if (isListening) {
+      speechRecognition.current?.stop();
+    } else {
+      speechRecognition.current?.start();
+    }
+  };
+
+  if (!session) {
+    return <Auth />;
+  }
+
+  if (appState === 'error') {
+    return (
+      <div className="flex flex-col h-screen bg-gray-950 text-gray-200 items-center justify-center p-8 text-center">
+        <div className="max-w-2xl bg-gray-900 border border-red-500/30 p-8 rounded-lg shadow-2xl shadow-red-500/10">
+          <h1 className="text-2xl font-bold text-red-400 mb-4">System Critical Error</h1>
+          <p className="text-gray-400 mb-2">The application failed to initialize. This is usually caused by a network issue or an incorrect configuration.</p>
+          <p className="text-sm font-mono bg-gray-800 p-4 rounded-md text-red-300">{initializationError}</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (appState === 'initializing') {
+    return (
+      <div className="flex flex-col h-screen bg-gray-950 text-gray-200 items-center justify-center p-8 text-center">
+        <div className="w-10 h-10 border-4 border-gray-700 border-t-blue-500 rounded-full animate-spin mb-4"></div>
+        <p className="text-gray-400">{appStatus}</p>
+      </div>
+    );
+  }
 
   return (
-    <div className="bg-black text-gray-200 h-screen flex flex-col font-mono">
-      <Header isTtsEnabled={isTtsEnabled} onToggleTts={toggleTts} />
-      <div ref={chatContainerRef} className="flex-grow overflow-y-auto p-4 sm:p-6 space-y-6">
-        {messages.length === 0 ? (
-          <WelcomeScreen onSendMessage={(prompt) => handleSendMessage(prompt)} />
-        ) : (
-          messages.map(msg => <ChatMessage key={msg.id} message={msg} />)
+    <div className="flex flex-col h-screen bg-gray-950 text-gray-200">
+      <Header 
+        isTtsEnabled={isTtsEnabled} 
+        onToggleTts={() => setIsTtsEnabled(prev => !prev)} 
+        onSignOut={handleSignOut}
+      />
+      <div ref={chatContainerRef} className="flex-1 overflow-y-auto p-4 md:p-6 space-y-6">
+        {messages.length === 0 && <WelcomeScreen onSendMessage={handleSendMessage} />}
+        {messages.map(msg => (
+          <ChatMessage key={msg.id} message={msg} />
+        ))}
+        {isAiReplying && (
+          <div className="flex justify-center items-center py-4">
+             <div className="w-10 h-10 border-4 border-gray-700 border-t-blue-500 rounded-full animate-spin"></div>
+          </div>
         )}
-         {isLoading && messages.length > 0 && messages[messages.length - 1]?.sender === 'ai' && !messages[messages.length - 1]?.text && (
-            <div className="flex justify-start">
-              <div className="bg-gray-800 rounded-lg p-3 max-w-lg animate-pulse">
-                <div className="flex space-x-1">
-                  <div className="w-2 h-2 bg-gray-500 rounded-full"></div>
-                  <div className="w-2 h-2 bg-gray-500 rounded-full"></div>
-                  <div className="w-2 h-2 bg-gray-500 rounded-full"></div>
-                </div>
-              </div>
-            </div>
-          )}
       </div>
-      <div className="p-4 bg-black border-t border-gray-800">
-        <ChatInput 
-          text={inputText} 
-          setText={setInputText}
-          onSendMessage={handleSendMessage} 
-          isLoading={isLoading} 
-          isListening={isListening}
-          onToggleListening={handleToggleListening}
-        />
+      <div className="p-4 md:p-6 bg-gray-950/80 backdrop-blur-sm border-t border-gray-800">
+        <div className="max-w-4xl mx-auto">
+            <ChatInput 
+                text={inputText} 
+                setText={setInputText} 
+                onSendMessage={handleSendMessage}
+                isLoading={isAiReplying}
+                isListening={isListening}
+                onToggleListening={toggleListening}
+                placeholder="Ask a question. Get a direct answer."
+            />
+        </div>
       </div>
     </div>
   );
